@@ -35,6 +35,25 @@ from omniORB import CORBA
 import OSR, OSR__POA
 import CosNaming
 
+# ── Global Values / Custom Configs ────────────────────────────────────────────────────────
+_ORDER_TYPE_LABELS = {
+    "pick":         ("PICK",         "1;36"),
+    "transport_gi": ("TRANSPORT GI", "1;33"),
+    "transport":    ("TRANSPORT",    "36"),
+    "inventory":    ("INVENTORY",    "35"),
+    "goods_in":     ("GOODS IN",     "1;32"),
+    "goods_add":    ("GOODS ADD",    "32"),
+    "dispatch":     ("DISPATCH",     "1;31"),
+    "unknown":      ("",             "2"),
+}
+
+# Order types for which a simulator insert should be attempted.
+# Add new types here to enable sim support without touching _do_sim_insert.
+_SIM_INSERT_TYPES = {"transport_gi", "pick", "transport"}
+
+# Order types for which we should always attempt a sim insert (i.e. skip presence check).
+_ALWAYS_SIM_INSERT = {"pick"}
+
 
 # ── Terminal colours (auto-disabled when stdout is not a TTY) ──────────────
 class _C:
@@ -269,25 +288,6 @@ def pick_sim_element(telegrams_dir, order_type, sim_state):
 # ─────────────────────────────────────────────────────────────────────────────
 # ORDER TYPE DETECTION + XML SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
-
-_ORDER_TYPE_LABELS = {
-    "pick":         ("PICK",         "1;36"),
-    "transport_gi": ("TRANSPORT GI", "1;33"),
-    "transport":    ("TRANSPORT",    "36"),
-    "inventory":    ("INVENTORY",    "35"),
-    "goods_in":     ("GOODS IN",     "1;32"),
-    "goods_add":    ("GOODS ADD",    "32"),
-    "dispatch":     ("DISPATCH",     "1;31"),
-    "unknown":      ("",             "2"),
-}
-
-# Order types for which a simulator insert should be attempted.
-# Add new types here to enable sim support without touching _do_sim_insert.
-_SIM_INSERT_TYPES = {"transport_gi", "pick", "transport"}
-
-# Order types for which we should always attempt a sim insert (i.e. skip presence check).
-_ALWAYS_SIM_INSERT = {"pick"}
-
 
 def detect_order_type(xml_str):
     """Return (order_type, order_number, container_number)."""

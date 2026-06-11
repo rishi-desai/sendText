@@ -195,11 +195,11 @@ Set via `cfg` in the queue menu. Examples: `RADTOTE001`, `T00001`, `C00001`.
 
 When the simulator is enabled, `sendText` automatically inserts the container into the simulator after each successful send.
 
-| Order type                                       | Sim insert behaviour                                                          |
-| ------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `TRANSPORT GI` / `TRANSPORT`                     | Inserts only if container is **not already present** in the simulator         |
-| `PICK`                                           | Always inserts                                                                |
-| `INVENTORY`, `GOODS IN`, `GOODS ADD`, `DISPATCH` | No sim insert by default — add to `_SIM_INSERT_TYPES` in the script to enable |
+| Order type                                       | Sim insert behaviour                                                                 |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `TRANSPORT GI` / `TRANSPORT`                     | Inserts only if container is **not already present** in the simulator                |
+| `PICK`                                           | Always inserts                                                                       |
+| `INVENTORY`, `GOODS IN`, `GOODS ADD`, `DISPATCH` | No sim insert by default — add to `_SIM_INSERT_TYPES` at top of the script to enable |
 
 Before each interactive session, `sendText` starts a background thread that runs `simulator --config simosrX.properties -c` and caches the full container list. The presence check reads from this in-memory cache instantly — no blocking wait during sends. The cache refreshes automatically every 30 seconds for the lifetime of the process.
 
