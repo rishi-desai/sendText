@@ -1,0 +1,1738 @@
+#!/usr/bin/python3
+#*****************************************************************************
+#
+# Version       : 3.0
+#
+# Date          : 2026-06-03
+#
+# Author        : rishi
+#
+# Description   : Send an XML telegram to the OSR
+#
+# ID            : send_text
+#
+#       The copyright to the computer program(s) herein is the property
+#       of Syslog.  The program(s) may be used  and/or copied only with
+#       the  written permission of  Syslog  or in  accordance with  the
+#       terms and conditions stipulated in the agreement/contract under
+#       which the program(s) have been supplied.
+#
+#*****************************************************************************
+
+import sys
+import os
+import json
+import re
+import subprocess
+import argparse
+import tempfile
+import shutil
+import time
+import threading
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from omniORB import CORBA
+import OSR, OSR__POA
+import CosNaming
+
+
+# ── Terminal colours (auto-disabled when stdout is not a TTY) ──────────────
+class _C:
+    _on = sys.stdout.isatty()
+
+    @staticmethod
+    def _esc(code, text):
+        return f"\033[{code}m{text}\033[0m" if _C._on else text
+
+    dim    = staticmethod(lambda t: _C._esc("2",    t))
+    red    = staticmethod(lambda t: _C._esc("31",   t))
+    green  = staticmethod(lambda t: _C._esc("32",   t))
+    yellow = staticmethod(lambda t: _C._esc("33",   t))
+    cyan   = staticmethod(lambda t: _C._esc("36",   t))
+    bold   = staticmethod(lambda t: _C._esc("1",    t))
+    b_red  = staticmethod(lambda t: _C._esc("1;31", t))
+    b_grn  = staticmethod(lambda t: _C._esc("1;32", t))
+    b_cyn  = staticmethod(lambda t: _C._esc("1;36", t))
+    b_yel  = staticmethod(lambda t: _C._esc("1;33", t))
+
+
+def _fmt_size(n):
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG DIRECTORY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cfg_dir(telegrams_dir):
+    d = os.path.join(telegrams_dir, "config")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ── Container naming ──────────────────────────────────────────────────────────
+
+_DEFAULT_NAMING = {"source_prefix": "", "target_prefix": ""}
+
+
+def load_container_naming(telegrams_dir):
+    path = os.path.join(_cfg_dir(telegrams_dir), "container_naming.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return {**_DEFAULT_NAMING, **json.load(f)}
+        except Exception:
+            pass
+    return dict(_DEFAULT_NAMING)
+
+
+def save_container_naming(telegrams_dir, naming):
+    path = os.path.join(_cfg_dir(telegrams_dir), "container_naming.json")
+    with open(path, "w") as f:
+        json.dump(naming, f, indent=2)
+
+
+# ── Simulator config ──────────────────────────────────────────────────────────
+
+_DEFAULT_SIM = {
+    "enabled": False,
+    "sim_user": "sandbox",
+    "default_source_element": "",
+    "default_target_element": "",
+}
+
+
+def load_sim_config(telegrams_dir):
+    path = os.path.join(_cfg_dir(telegrams_dir), "sim.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return {**_DEFAULT_SIM, **json.load(f)}
+        except Exception:
+            pass
+    return dict(_DEFAULT_SIM)
+
+
+def save_sim_config(telegrams_dir, cfg):
+    path = os.path.join(_cfg_dir(telegrams_dir), "sim.json")
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def load_element_list(telegrams_dir, filename):
+    path = os.path.join(_cfg_dir(telegrams_dir), filename)
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+
+def save_element_list(telegrams_dir, filename, elements):
+    path = os.path.join(_cfg_dir(telegrams_dir), filename)
+    with open(path, "w") as f:
+        for e in elements:
+            f.write(e + "\n")
+
+
+def run_sim(sim_user, sim_osr, element_filter, container):
+    cmd = (
+        f"sudo su - {sim_user} -c "
+        f"'simulator --config {sim_osr}.properties -i {element_filter} {container}'"
+    )
+    print(_C.dim(f"  sim: {cmd}"))
+    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        print(_C.yellow(f"  Warning: sim insert exited {result.returncode}: {output}"))
+        return False
+    return True
+
+
+# ── Simulator container cache ────────────────────────────────────────────────
+# Container lists are fetched in a background thread so sends don't block.
+# Cache is keyed by sim_osr and expires after _SIM_CACHE_TTL seconds.
+
+_SIM_CACHE_TTL  = 60  # seconds before a cached container list is considered stale
+_sim_cache      = {}  # {sim_osr: {"output": str, "fetched_at": float}}
+_sim_cache_lock = threading.Lock()
+
+
+def _fetch_sim_containers(sim_user, sim_osr):
+    """Fetch the full container list from the simulator and store it in the cache.
+
+    Intended to be called from a daemon thread via prefetch_sim_cache().
+    Uses the simulator binary directly (same as run_sim) so it works in the
+    non-interactive sudo su shell where wrapper scripts are not on PATH.
+    """
+    cmd = (
+        f"sudo su - {sim_user} -c "
+        f"'simulator --config {sim_osr}.properties -c'"
+    )
+    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    output = result.stdout + result.stderr
+    with _sim_cache_lock:
+        _sim_cache[sim_osr] = {"output": output, "fetched_at": time.monotonic()}
+
+
+def _start_sim_cache_refresher(sim_user, sim_osr):
+    """Start a single daemon thread that keeps the container cache continuously warm.
+
+    The thread runs for the lifetime of the process, refreshing the cache every
+    _SIM_CACHE_TTL / 2 seconds so it is always near-fresh when sim_container_exists()
+    is called.  Safe to call multiple times — only one thread is ever started.
+    """
+    if getattr(_start_sim_cache_refresher, "_started", False):
+        return
+    _start_sim_cache_refresher._started = True
+
+    def _loop():
+        while True:
+            _fetch_sim_containers(sim_user, sim_osr)
+            time.sleep(_SIM_CACHE_TTL / 2)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+def sim_container_exists(sim_user, sim_osr, container):
+    """Return True if container is already registered in the simulator.
+
+    Uses the in-memory cache populated by prefetch_sim_cache() / _fetch_sim_containers().
+    If the cache is stale or missing, fetches inline (blocking) as a fallback.
+    """
+    with _sim_cache_lock:
+        entry = _sim_cache.get(sim_osr)
+        if entry and (time.monotonic() - entry["fetched_at"]) < _SIM_CACHE_TTL:
+            return container.lower() in entry["output"].lower()
+
+    # Cache miss or expired — fetch inline so we always get a correct answer.
+    print(_C.dim("  Sim: refreshing container list..."))
+    _fetch_sim_containers(sim_user, sim_osr)
+    with _sim_cache_lock:
+        entry = _sim_cache.get(sim_osr)
+    return bool(entry) and container.lower() in entry["output"].lower()
+
+
+def _do_sim_insert(cfg_sim, order_type, container_num, osrid, telegrams_dir, sim_state):
+    """Perform a simulator insert after sending an order.
+
+    Only runs for order types listed in _SIM_INSERT_TYPES.  Always checks
+    whether the container is already present in the simulator before inserting
+    to avoid duplicates.
+
+    To enable sim inserts for a new order type, add it to _SIM_INSERT_TYPES.
+    To change which element list a new type uses, update pick_sim_element.
+    """
+    if not cfg_sim.get("enabled"):
+        return
+    if order_type not in _SIM_INSERT_TYPES:
+        return
+
+    sim_osr = f"sim{osrid}"
+
+    if order_type not in _ALWAYS_SIM_INSERT:
+        if sim_container_exists(cfg_sim["sim_user"], sim_osr, container_num):
+            print(_C.dim(f"  Sim: {container_num} already present — skipping insert."))
+            return
+
+    element = pick_sim_element(telegrams_dir, order_type, sim_state)
+    if element:
+        run_sim(cfg_sim["sim_user"], sim_osr, element, container_num)
+    else:
+        print(_C.yellow("  Sim enabled but no element configured — skipping."))
+
+
+def pick_sim_element(telegrams_dir, order_type, sim_state):
+    """Round-robin element selection. sim_state is a mutable dict with index counters."""
+    cfg = load_sim_config(telegrams_dir)
+    if order_type in ("transport_gi", "transport"):
+        elements = load_element_list(telegrams_dir, "sourceLoop.txt")
+        if elements:
+            idx = sim_state.get("source_idx", 0) % len(elements)
+            sim_state["source_idx"] = idx + 1
+            return elements[idx]
+        return cfg.get("default_source_element") or None
+    elif order_type == "pick":
+        elements = load_element_list(telegrams_dir, "targetLoop.txt")
+        if elements:
+            idx = sim_state.get("target_idx", 0) % len(elements)
+            sim_state["target_idx"] = idx + 1
+            return elements[idx]
+        return cfg.get("default_target_element") or None
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER TYPE DETECTION + XML SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ORDER_TYPE_LABELS = {
+    "pick":         ("PICK",         "1;36"),
+    "transport_gi": ("TRANSPORT GI", "1;33"),
+    "transport":    ("TRANSPORT",    "36"),
+    "inventory":    ("INVENTORY",    "35"),
+    "goods_in":     ("GOODS IN",     "1;32"),
+    "goods_add":    ("GOODS ADD",    "32"),
+    "dispatch":     ("DISPATCH",     "1;31"),
+    "unknown":      ("",             "2"),
+}
+
+# Order types for which a simulator insert should be attempted.
+# Add new types here to enable sim support without touching _do_sim_insert.
+_SIM_INSERT_TYPES = {"transport_gi", "pick", "transport"}
+
+# Order types for which we should always attempt a sim insert (i.e. skip presence check).
+_ALWAYS_SIM_INSERT = {"pick"}
+
+
+def detect_order_type(xml_str):
+    """Return (order_type, order_number, container_number)."""
+    try:
+        root = ET.fromstring(xml_str)
+        if root.tag == "host2osr":
+            children = list(root)
+            child = children[0] if children else root
+        else:
+            child = root
+
+        tag = child.tag
+        order_number = child.get("order_number", "")
+        container_number = child.get("container_number", "")
+
+        if tag == "pick_order":
+            return "pick", order_number, container_number
+
+        if tag == "transport_order":
+            cont_el = child.find(".//container")
+            if cont_el is not None and not container_number:
+                container_number = cont_el.get("container_number", "")
+            if child.find(".//product") is not None:
+                return "transport_gi", order_number, container_number
+            return "transport", order_number, container_number
+
+        if tag == "inventory_order":
+            return "inventory", order_number, container_number
+
+        if tag == "goods_in_order":
+            # goods_add is a goods_in_order that contains a child element with text value "renewal"
+            if any(el.text and el.text.strip().lower() == "renewal" for el in child.iter()):
+                return "goods_add", order_number, container_number
+            return "goods_in", order_number, container_number
+
+        if tag == "dispatch_order":
+            return "dispatch", order_number, container_number
+
+        return "unknown", order_number, container_number
+    except Exception:
+        return "unknown", "", ""
+
+
+def xml_summary(path):
+    try:
+        content = _read_file(path)
+        order_type, order_number, container_number = detect_order_type(content)
+
+        if order_type != "unknown":
+            label, colour = _ORDER_TYPE_LABELS[order_type]
+            label_str = _C._esc(colour, f"{label:<14}") if _C._on else f"{label:<14}"
+            parts = []
+            if order_number:
+                parts.append(_C.dim("ord:") + " " + order_number)
+            if container_number:
+                parts.append(_C.dim("cont:") + " " + container_number)
+            return label_str + "  " + "  ".join(parts)
+
+        # Fallback: generic display
+        root = ET.fromstring(content)
+        tag = root.tag
+        attrs = root.attrib
+        attr_str = ""
+        if attrs:
+            k, v = next(iter(attrs.items()))
+            short_v = v if len(v) <= 20 else v[:17] + "..."
+            attr_str = f' {k}="{short_v}"'
+            if len(attrs) > 1:
+                attr_str += f" +{len(attrs) - 1}"
+        children = list(root)
+        n = len(children)
+        child_str = (
+            _C.dim(f"  [{n} child]" if n == 1 else f"  [{n} children]")
+            if children else ""
+        )
+        return _C.yellow(f"<{tag}{attr_str}>") + child_str
+    except Exception:
+        return _C.dim("<invalid/unreadable>")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INCREMENT SUFFIX
+# ─────────────────────────────────────────────────────────────────────────────
+
+def increment_suffix(base, n=1):
+    """Increment trailing numeric suffix of base by n, preserving zero-padding."""
+    m = re.match(r'^(.*?)(\d+)$', str(base))
+    if not m:
+        return base
+    prefix, digits = m.group(1), m.group(2)
+    return prefix + str(int(digits) + n).zfill(len(digits))
+
+
+def _suffix_number(base):
+    m = re.match(r'^(.*?)(\d+)$', str(base))
+    return int(m.group(2)) if m else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUEUE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class QueueEntry:
+    def __init__(self, template_path, xml_template, count, order_type, order_num_base, container_base):
+        self.template_path  = template_path
+        self.xml_template   = xml_template
+        self.count          = count
+        self.order_type     = order_type
+        self.order_num_base = order_num_base
+        self.container_base = container_base
+
+
+def _expand_xml(xml_template, order_num_base, order_num_new, container_base, container_new):
+    result = xml_template
+    if order_num_base and order_num_new != order_num_base:
+        result = result.replace(
+            f'order_number="{order_num_base}"',
+            f'order_number="{order_num_new}"', 1
+        )
+    if container_base and container_new != container_base:
+        result = result.replace(
+            f'container_number="{container_base}"',
+            f'container_number="{container_new}"', 1
+        )
+    return result
+
+
+def _expand_queue_entry(entry):
+    """Return list of (order_num, container_num, xml) for this entry."""
+    items = []
+    for i in range(entry.count):
+        on  = increment_suffix(entry.order_num_base, i)
+        cn  = increment_suffix(entry.container_base, i)
+        xml = _expand_xml(entry.xml_template, entry.order_num_base, on, entry.container_base, cn)
+        items.append((on, cn, xml))
+    return items
+
+
+def _next_container_base(queue, prefix, types):
+    """Find the starting container number that doesn't overlap with existing queue entries of the given types."""
+    max_n = _suffix_number(prefix)
+    if max_n is None:
+        return prefix
+    for entry in queue:
+        if entry.order_type in types:
+            last_n = _suffix_number(increment_suffix(entry.container_base, entry.count - 1))
+            if last_n is not None and last_n >= max_n:
+                max_n = last_n + 1
+    m = re.match(r'^(.*?)(\d+)$', str(prefix))
+    if m:
+        return m.group(1) + str(max_n).zfill(len(m.group(2)))
+    return prefix
+
+
+def _add_to_queue(queue, path, content, count, telegrams_dir):
+    order_type, order_num, container_num = detect_order_type(content)
+    naming = load_container_naming(telegrams_dir)
+
+    if order_type in ("transport_gi", "transport") and naming.get("source_prefix"):
+        container_num = _next_container_base(queue, naming["source_prefix"], ("transport_gi", "transport"))
+    elif order_type == "pick" and naming.get("target_prefix"):
+        container_num = _next_container_base(queue, naming["target_prefix"], ("pick",))
+
+    queue.append(QueueEntry(
+        template_path=path,
+        xml_template=content,
+        count=count,
+        order_type=order_type,
+        order_num_base=order_num or "ORD-001",
+        container_base=container_num or "TOTE001",
+    ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE I/O
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_file(path):
+    with open(path, "r") as f:
+        return f.read().strip()
+
+
+def list_saved_telegrams(telegrams_dir):
+    if not os.path.isdir(telegrams_dir):
+        return []
+    xml_files = [
+        os.path.join(telegrams_dir, f)
+        for f in os.listdir(telegrams_dir)
+        if f.endswith(".xml") and not f.startswith(".")
+    ]
+    return sorted(xml_files, key=os.path.getmtime, reverse=True)
+
+
+def latest_telegram_path(telegrams_dir):
+    saved = list_saved_telegrams(telegrams_dir)
+    return saved[0] if saved else None
+
+
+_SEP = _C.dim("  " + "─" * 102)
+
+
+def _filter_telegrams(saved, query):
+    """Return paths whose filename or summary contains query (case-insensitive)."""
+    q = query.lower()
+    result = []
+    for path in saved:
+        if q in os.path.basename(path).lower():
+            result.append(path)
+        else:
+            try:
+                if q in xml_summary(path).lower():
+                    result.append(path)
+            except Exception:
+                pass
+    return result
+
+
+def _parse_indices(tokens, max_n):
+    """Parse tokens like ['1', '2-4', '3'] into a sorted list of 0-based indices."""
+    indices = set()
+    for tok in tokens:
+        for part in tok.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo_s, _, hi_s = part.partition("-")
+                try:
+                    lo, hi = int(lo_s), int(hi_s)
+                    for i in range(lo, hi + 1):
+                        if 1 <= i <= max_n:
+                            indices.add(i - 1)
+                except ValueError:
+                    pass
+            else:
+                try:
+                    i = int(part)
+                    if 1 <= i <= max_n:
+                        indices.add(i - 1)
+                except ValueError:
+                    pass
+    return sorted(indices)
+
+
+def _print_telegram_list(paths, search_query=None):
+    """Print a (possibly filtered) list of telegram paths. Returns paths."""
+    if not paths:
+        if search_query:
+            print(_C.yellow(f"  No telegrams matching '{search_query}'."))
+        else:
+            print(_C.yellow("  No saved telegrams found in telegrams/."))
+        return paths
+    header = _C.bold("  Saved telegrams") + _C.dim("  (newest first)")
+    if search_query:
+        n = len(paths)
+        header += "   " + _C.yellow(f"/{search_query}") + _C.dim(f"  ({n} match{'es' if n != 1 else ''})")
+    print()
+    print(header)
+    print(_SEP)
+    for idx, path in enumerate(paths, start=1):
+        filename  = os.path.basename(path)
+        modified  = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
+        size      = _fmt_size(os.path.getsize(path))
+        summary   = xml_summary(path)
+        num       = _C.b_cyn(f"{idx:>3})")
+        fname     = _C.cyan(f"{filename:<42}")
+        ts        = _C.dim(modified)
+        sz        = _C.dim(f"{size:>7}")
+        print(f"  {num}  {fname}  {ts}  {sz}   {summary}")
+    print(_SEP)
+    return paths
+
+
+def print_saved_telegrams(telegrams_dir):
+    saved = list_saved_telegrams(telegrams_dir)
+    return _print_telegram_list(saved)
+
+
+def save_telegram_new(order, telegrams_dir):
+    """Save as a new timestamped file. Skips creation if identical XML already exists."""
+    os.makedirs(telegrams_dir, exist_ok=True)
+    normalized = order.strip()
+    for filename in sorted(f for f in os.listdir(telegrams_dir) if f.endswith(".xml") and not f.startswith(".")):
+        path = os.path.join(telegrams_dir, filename)
+        try:
+            if _read_file(path) == normalized:
+                return filename, False
+        except OSError:
+            continue
+    filename = datetime.now().strftime("telegram_%Y%m%d_%H%M%S_%f.xml")
+    path = os.path.join(telegrams_dir, filename)
+    with open(path, "w") as f:
+        f.write(normalized + "\n")
+    return filename, True
+
+
+def _overwrite_telegram(path, content):
+    with open(path, "w") as f:
+        f.write(content.strip() + "\n")
+
+
+def rename_telegram(old_path, new_name, telegrams_dir):
+    new_name = new_name.strip()
+    if new_name.lower().endswith(".xml"):
+        new_name = new_name[:-4]
+    if not new_name:
+        return None
+    new_path = os.path.join(telegrams_dir, new_name + ".xml")
+    if os.path.exists(new_path):
+        print(_C.b_red(f"  Error: {new_name}.xml already exists."))
+        return None
+    try:
+        os.rename(old_path, new_path)
+        return new_path
+    except OSError as e:
+        print(_C.b_red(f"  Error renaming: {e}"))
+        return None
+
+
+def duplicate_telegram(source_path, telegrams_dir):
+    content = _read_file(source_path)
+    filename = datetime.now().strftime("telegram_%Y%m%d_%H%M%S_%f.xml")
+    new_path = os.path.join(telegrams_dir, filename)
+    with open(new_path, "w") as f:
+        f.write(content + "\n")
+    return new_path
+
+
+def delete_telegram(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError as e:
+        print(_C.b_red(f"  Error deleting {os.path.basename(path)}: {e}"))
+        return False
+
+
+def resolve_saved_telegram(saved_arg, telegrams_dir):
+    candidates = [saved_arg, os.path.join(telegrams_dir, saved_arg)]
+    if not saved_arg.endswith(".xml"):
+        candidates += [saved_arg + ".xml", os.path.join(telegrams_dir, saved_arg + ".xml")]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    print(_C.b_red(f"  Error: saved telegram not found: {saved_arg}"))
+    print(_C.dim("  Tip: use --list-saved or --pick to see available telegrams."))
+    sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDITOR HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _open_editor(editor, initial_content=""):
+    """Open editor with initial_content in a temp file. Returns edited content or None."""
+    fd, tmp_path = tempfile.mkstemp(prefix="sendText_", suffix=".xml")
+    os.close(fd)
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(initial_content)
+        ret = subprocess.call([editor, tmp_path])
+        if ret != 0:
+            print(_C.b_red(f"  Error: editor exited with code {ret}"))
+            return None
+        if not os.path.exists(tmp_path):
+            print(_C.b_red("  Error: editor temp file not found"))
+            return None
+        content = _read_file(tmp_path)
+        return content if content else None
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _validate_xml(content):
+    try:
+        ET.fromstring(content)
+        return True
+    except ET.ParseError as e:
+        print(_C.b_red(f"  Invalid XML — {e}"))
+        return False
+
+
+def create_new_telegram(editor, telegrams_dir):
+    """Open editor for a brand-new telegram. Returns (path, content) or (None, None)."""
+    print(_C.dim(f"  Opening {editor} — write your XML, save, and quit..."))
+    content = _open_editor(editor, "")
+    if not content:
+        print(_C.dim("  Empty file — no telegram created."))
+        return None, None
+    if not _validate_xml(content):
+        return None, None
+    filename, _ = save_telegram_new(content, telegrams_dir)
+    path = os.path.join(telegrams_dir, filename)
+    return path, content
+
+
+def edit_telegram_in_place(editor, source_path):
+    """Open editor with existing file content. Overwrites the file on save. Returns new content or None."""
+    initial = _read_file(source_path)
+    print(_C.dim(f"  Editing: {os.path.basename(source_path)}"))
+    print(_C.dim(f"  Opening {editor} — save and quit to continue..."))
+    content = _open_editor(editor, initial)
+    if content is None:
+        return None
+    if not _validate_xml(content):
+        return None
+    _overwrite_telegram(source_path, content)
+    return content
+
+
+def _edit_new_from_latest(editor, telegrams_dir):
+    """Open editor with latest telegram as template. Returns content (does NOT save yet)."""
+    latest = latest_telegram_path(telegrams_dir)
+    if latest:
+        print(_C.dim(f"  Template: telegrams/{os.path.basename(latest)}"))
+        initial = _read_file(latest)
+    else:
+        print(_C.yellow("  No saved telegrams yet. Opening a blank editor file."))
+        initial = ""
+    print(_C.dim(f"  Opening {editor} — save and quit to continue..."))
+    content = _open_editor(editor, initial)
+    if content is None:
+        sys.exit(1)
+    return content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORBA SEND
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sendOrder(order, osrid):
+    """Returns True on success, False on failure (does NOT call sys.exit)."""
+    orb = CORBA.ORB_init([], CORBA.ORB_ID)
+    orb.resolve_initial_references("RootPOA")
+    obj = orb.resolve_initial_references("NameService")
+    rootContext = obj._narrow(CosNaming.NamingContext)
+    try:
+        name = [
+            CosNaming.NameComponent(osrid, ""),
+            CosNaming.NameComponent("ServicePorts", ""),
+            CosNaming.NameComponent("Hio", ""),
+        ]
+        sobj = rootContext.resolve(name)
+        servant = sobj._narrow(OSR.Hio.ServicePort)
+        servant.sendOrder(order)
+        return True
+    except Exception as e:
+        print(_C.b_red(f"  Unable to send order: {e}"))
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XML PREVIEW
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_xml_preview(xml_str):
+    print()
+    print(_C.dim("  " + "─" * 78))
+    for line in xml_str.splitlines():
+        print("  " + line)
+    print(_C.dim("  " + "─" * 78))
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIM MENU
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sim_menu(telegrams_dir, osrid):
+    while True:
+        cfg = load_sim_config(telegrams_dir)
+        src_elems = load_element_list(telegrams_dir, "sourceLoop.txt")
+        tgt_elems = load_element_list(telegrams_dir, "targetLoop.txt")
+        sim_osr   = f"sim{osrid}" if osrid else _C.dim("(not set)")
+        enabled   = _C.b_grn("ENABLED") if cfg["enabled"] else _C.b_red("DISABLED")
+
+        print()
+        print(_C.bold("  Simulator Configuration"))
+        print(_C.dim("  " + "─" * 78))
+        print(f"  Status          : {enabled}")
+        print(f"  Sim OSR         : {_C.cyan(sim_osr)}  {_C.dim('(derived from OSR_ID)')}")
+        print(f"  Sim user        : {_C.cyan(cfg['sim_user'])}")
+        print(f"  Default source  : {_C.cyan(cfg['default_source_element'] or '(none)')}")
+        print(f"  Default target  : {_C.cyan(cfg['default_target_element'] or '(none)')}")
+        print()
+        print(f"  Source elements  {_C.dim('sourceLoop.txt')}  [{len(src_elems)} entry/entries]")
+        for i, e in enumerate(src_elems, 1):
+            print(f"    {_C.dim(str(i)+'.')} {e}")
+        if not src_elems:
+            print(_C.dim("    (empty)"))
+        print(f"  Target elements  {_C.dim('targetLoop.txt')}  [{len(tgt_elems)} entry/entries]")
+        for i, e in enumerate(tgt_elems, 1):
+            print(f"    {_C.dim(str(i)+'.')} {e}")
+        if not tgt_elems:
+            print(_C.dim("    (empty)"))
+        print(_C.dim("  " + "─" * 78))
+        print(
+            "  " + _C.bold("toggle") + _C.dim("  on/off   ")
+            + _C.bold("user <name>") + _C.dim("  sim user   ")
+            + _C.bold("src <elem>") + _C.dim("  default source   ")
+            + _C.bold("tgt <elem>") + _C.dim("  default target")
+        )
+        print(
+            "  " + _C.bold("addsrc <elem>") + _C.dim("  add sourceLoop   ")
+            + _C.bold("addtgt <elem>") + _C.dim("  add targetLoop   ")
+            + _C.b_red("delsrc <n>") + _C.dim("  remove source #n   ")
+            + _C.b_red("deltgt <n>") + _C.dim("  remove target #n   ")
+            + _C.bold("back") + _C.dim("  return")
+        )
+        print()
+
+        try:
+            raw = input(_C.b_cyn("  sim> ") if _C._on else "  sim> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not raw:
+            continue
+
+        parts = raw.split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd in ("back", "b", "q"):
+            break
+        elif cmd == "toggle":
+            cfg["enabled"] = not cfg["enabled"]
+            save_sim_config(telegrams_dir, cfg)
+            print(f"  Sim insert {_C.b_grn('enabled') if cfg['enabled'] else _C.b_red('disabled')}.")
+        elif cmd == "user":
+            if arg:
+                cfg["sim_user"] = arg
+                save_sim_config(telegrams_dir, cfg)
+                print(_C.b_grn("  Sim user updated."))
+            else:
+                print(_C.yellow("  Usage: user <name>"))
+        elif cmd == "src":
+            cfg["default_source_element"] = arg
+            save_sim_config(telegrams_dir, cfg)
+            print(_C.b_grn("  Default source element updated."))
+        elif cmd == "tgt":
+            cfg["default_target_element"] = arg
+            save_sim_config(telegrams_dir, cfg)
+            print(_C.b_grn("  Default target element updated."))
+        elif cmd == "addsrc":
+            if arg:
+                src_elems.append(arg)
+                save_element_list(telegrams_dir, "sourceLoop.txt", src_elems)
+                print(_C.b_grn("  Added to sourceLoop."))
+            else:
+                print(_C.yellow("  Usage: addsrc <element>"))
+        elif cmd == "addtgt":
+            if arg:
+                tgt_elems.append(arg)
+                save_element_list(telegrams_dir, "targetLoop.txt", tgt_elems)
+                print(_C.b_grn("  Added to targetLoop."))
+            else:
+                print(_C.yellow("  Usage: addtgt <element>"))
+        elif cmd == "delsrc":
+            try:
+                i = int(arg) - 1
+                if 0 <= i < len(src_elems):
+                    removed = src_elems.pop(i)
+                    save_element_list(telegrams_dir, "sourceLoop.txt", src_elems)
+                    print(_C.b_red(f"  Removed: {removed}"))
+                else:
+                    print(_C.yellow("  Invalid index."))
+            except ValueError:
+                print(_C.yellow("  Usage: delsrc <n>"))
+        elif cmd == "deltgt":
+            try:
+                i = int(arg) - 1
+                if 0 <= i < len(tgt_elems):
+                    removed = tgt_elems.pop(i)
+                    save_element_list(telegrams_dir, "targetLoop.txt", tgt_elems)
+                    print(_C.b_red(f"  Removed: {removed}"))
+                else:
+                    print(_C.yellow("  Invalid index."))
+            except ValueError:
+                print(_C.yellow("  Usage: deltgt <n>"))
+        else:
+            print(_C.yellow("  Unknown command."))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTAINER NAMING MINI-MENU
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cfg_naming_menu(telegrams_dir):
+    naming = load_container_naming(telegrams_dir)
+    print()
+    print(_C.bold("  Container Naming"))
+    print(_C.dim("  Source prefix (transport GI / transport) : ") + _C.cyan(naming["source_prefix"] or "(none)"))
+    print(_C.dim("  Target prefix (pick)                     : ") + _C.cyan(naming["target_prefix"] or "(none)"))
+    print(_C.dim("  Examples: T00001, RADTOTE001, C00001. Enter new value or press Enter to keep."))
+    print()
+    try:
+        src = input(_C.dim("  Source prefix: ")).strip()
+        if src:
+            naming["source_prefix"] = src
+        tgt = input(_C.dim("  Target prefix: ")).strip()
+        if tgt:
+            naming["target_prefix"] = tgt
+        save_container_naming(telegrams_dir, naming)
+        print(_C.b_grn("  Saved."))
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUEUE DISPLAY
+# ─────────────────────────────────────────────────────────────────────────────
+
+_Q_SEP = _C.dim("  " + "─" * 102)
+
+
+def _print_queue(queue, send_delay):
+    total = sum(e.count for e in queue)
+    print()
+    print(
+        _C.bold("  Queue")
+        + _C.dim(f"  ({total} order{'s' if total != 1 else ''} total)")
+        + "    "
+        + _C.dim(f"[delay: {send_delay}s]")
+    )
+    print(_Q_SEP)
+    if not queue:
+        print(_C.dim("  (empty — use 'a <num> [count]' or 'n' to add)"))
+    else:
+        for qi, e in enumerate(queue, 1):
+            label, colour = _ORDER_TYPE_LABELS.get(e.order_type, ("", "2"))
+            label_str = _C._esc(colour, f"{label:<14}") if _C._on else f"{label:<14}"
+            fname = _C.cyan(os.path.basename(e.template_path))
+            if e.count > 1:
+                last_on = increment_suffix(e.order_num_base, e.count - 1)
+                last_cn = increment_suffix(e.container_base, e.count - 1)
+                rng = (
+                    _C.dim("ord:")  + f" {e.order_num_base}..{last_on}  "
+                    + _C.dim("cont:") + f" {e.container_base}..{last_cn}"
+                )
+            else:
+                rng = (
+                    _C.dim("ord:")  + f" {e.order_num_base}  "
+                    + _C.dim("cont:") + f" {e.container_base}"
+                )
+            qn = _C.b_yel(f"Q{qi:>2})")
+            print(f"  {qn}  {label_str}  {_C.bold(f'x{e.count}'):>4}  {fname:<42}  {rng}")
+    print(_Q_SEP)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUEUE MENU
+# ─────────────────────────────────────────────────────────────────────────────
+
+_QUEUE_HELP_TGRAMS = (
+    _C.dim("  ── Telegrams ── ")
+    + _C.bold("v <n>") + _C.dim(" preview   ")
+    + _C.bold("e <n>") + _C.dim(" edit   ")
+    + _C.b_red("d <n..>") + _C.dim(" delete   ")
+    + _C.bold("dup <n>") + _C.dim(" copy   ")
+    + _C.b_grn("n") + _C.dim(" new   ")
+    + _C.bold("m <n>") + _C.dim(" rename   ")
+    + _C.bold("/<text>") + _C.dim(" search")
+)
+_QUEUE_HELP_QUEUE = (
+    _C.dim("  ── Queue ── ")
+    + _C.bold("a <n> [count]") + _C.dim(" add   ")
+    + _C.b_red("dq <n>") + _C.dim(" remove   ")
+    + _C.bold("xq <n> <count>") + _C.dim(" set count   ")
+    + _C.bold("vq <n>") + _C.dim(" preview expanded")
+)
+_QUEUE_HELP_ACTIONS = (
+    _C.dim("  ── Actions ── ")
+    + _C.b_grn("send") + _C.dim(" / ")
+    + _C.b_grn("s") + _C.dim(" send all   ")
+    + _C.bold("clear") + _C.dim(" clear queue   ")
+    + _C.bold("delay <s>") + _C.dim(" set delay   ")
+    + _C.bold("cfg") + _C.dim(" naming   ")
+    + _C.bold("sim") + _C.dim(" simulator   ")
+    + _C.bold("r") + _C.dim(" refresh   ")
+    + _C.bold("back") + _C.dim(" return")
+)
+
+
+def queue_menu(telegrams_dir, osrid, editor, queue, send_delay_ref):
+    sim_state = {"source_idx": 0, "target_idx": 0}
+    search_query = None
+
+    while True:
+        all_saved = list_saved_telegrams(telegrams_dir)
+        if search_query:
+            saved = _print_telegram_list(_filter_telegrams(all_saved, search_query), search_query)
+        else:
+            saved = _print_telegram_list(all_saved)
+        _print_queue(queue, send_delay_ref[0])
+        print(_QUEUE_HELP_TGRAMS)
+        print(_QUEUE_HELP_QUEUE)
+        print(_QUEUE_HELP_ACTIONS)
+        print()
+
+        try:
+            raw = input(_C.b_yel("  queue> ") if _C._on else "  queue> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n" + _C.dim("  Returning to picker."))
+            break
+
+        if not raw:
+            continue
+
+        parts = raw.split()
+        cmd = parts[0].lower()
+
+        # ── Navigation ──────────────────────────────────────────────────────
+        if cmd in ("back", "b"):
+            break
+
+        if cmd == "r":
+            continue
+
+        # ── New telegram ────────────────────────────────────────────────────
+        if cmd == "n":
+            new_path, content = create_new_telegram(editor, telegrams_dir)
+            if new_path:
+                print(_C.b_grn("  Created ") + _C.cyan(os.path.basename(new_path)))
+                try:
+                    ans = input(_C.dim("  Add to queue? Enter count (or Enter to skip): ")).strip()
+                    if ans:
+                        c = int(ans)
+                        if c > 0:
+                            _add_to_queue(queue, new_path, content, c, telegrams_dir)
+                            print(_C.b_grn(f"  Added {c}× to queue."))
+                except (ValueError, EOFError, KeyboardInterrupt):
+                    pass
+            continue
+
+        # ── Preview telegram ────────────────────────────────────────────────
+        if cmd == "v":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: v <n>"))
+                continue
+            try:
+                i = int(parts[1]) - 1
+                if 0 <= i < len(saved):
+                    _print_xml_preview(_read_file(saved[i]))
+                else:
+                    print(_C.yellow("  Invalid selection."))
+            except ValueError:
+                print(_C.yellow("  Usage: v <n>"))
+            continue
+
+        # ── Edit telegram in-place ──────────────────────────────────────────
+        if cmd == "e":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: e <n>"))
+                continue
+            try:
+                i = int(parts[1]) - 1
+                if 0 <= i < len(saved):
+                    sel = saved[i]
+                    new_content = edit_telegram_in_place(editor, sel)
+                    if new_content:
+                        print(_C.b_grn("  Updated ") + _C.cyan(os.path.basename(sel)))
+                        # Sync any queue entries that use this file
+                        for qe in queue:
+                            if qe.template_path == sel:
+                                qe.xml_template = new_content
+                                qe.order_type, qe.order_num_base, qe.container_base = detect_order_type(new_content)
+                else:
+                    print(_C.yellow("  Invalid selection."))
+            except ValueError:
+                print(_C.yellow("  Usage: e <n>"))
+            continue
+
+        # ── Delete telegram(s) ──────────────────────────────────────────────
+        if cmd == "d":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: d <n> [n2 n3 ...] or d <n>-<m>"))
+                continue
+            idxs = _parse_indices(parts[1:], len(saved))
+            if not idxs:
+                print(_C.yellow("  No valid indices provided."))
+                continue
+            targets = [saved[i] for i in idxs]
+            if len(targets) == 1:
+                fname = os.path.basename(targets[0])
+                prompt = _C.b_red(f"  Delete {fname}?") + _C.dim(" (y/n) ")
+            else:
+                print(_C.b_red(f"  Delete {len(targets)} telegrams:"))
+                for t in targets:
+                    print(_C.dim(f"    {os.path.basename(t)}"))
+                prompt = _C.b_red("  Confirm delete all?") + _C.dim(" (y/n) ")
+            try:
+                ans = input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if ans in ("y", "yes"):
+                for t in targets:
+                    if delete_telegram(t):
+                        print(_C.b_red("  Deleted ") + _C.dim(os.path.basename(t)))
+                        queue[:] = [qe for qe in queue if qe.template_path != t]
+            else:
+                print(_C.dim("  Delete cancelled."))
+            continue
+
+        # ── Duplicate telegram ──────────────────────────────────────────────
+        if cmd == "dup":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: dup <n>"))
+                continue
+            try:
+                i = int(parts[1]) - 1
+                if 0 <= i < len(saved):
+                    new_path = duplicate_telegram(saved[i], telegrams_dir)
+                    print(_C.b_grn("  Copied \u2192 ") + _C.cyan(os.path.basename(new_path)))
+                else:
+                    print(_C.yellow("  Invalid selection."))
+            except ValueError:
+                print(_C.yellow("  Usage: dup <n>"))
+            continue
+
+        # ── Rename telegram ─────────────────────────────────────────────────
+        if cmd == "m":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: m <n>"))
+                continue
+            try:
+                i = int(parts[1]) - 1
+                if 0 <= i < len(saved):
+                    sel = saved[i]
+                    fname = os.path.basename(sel)
+                    try:
+                        new_name = input(_C.dim(f"  Rename '{fname}' to: ")).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        continue
+                    if new_name:
+                        new_path = rename_telegram(sel, new_name, telegrams_dir)
+                        if new_path:
+                            print(_C.b_grn("  Renamed \u2192 ") + _C.cyan(os.path.basename(new_path)))
+                            for qe in queue:
+                                if qe.template_path == sel:
+                                    qe.template_path = new_path
+                else:
+                    print(_C.yellow("  Invalid selection."))
+            except ValueError:
+                print(_C.yellow("  Usage: m <n>"))
+            continue
+
+        # ── Add to queue ────────────────────────────────────────────────────
+        if cmd == "a":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: a <n> [count]"))
+                continue
+            try:
+                i     = int(parts[1]) - 1
+                count = int(parts[2]) if len(parts) >= 3 else 1
+                if count < 1:
+                    print(_C.yellow("  Count must be >= 1."))
+                    continue
+                if 0 <= i < len(saved):
+                    content = _read_file(saved[i])
+                    _add_to_queue(queue, saved[i], content, count, telegrams_dir)
+                    total = sum(e.count for e in queue)
+                    print(
+                        _C.b_grn(f"  Added {count}\u00d7 ")
+                        + _C.cyan(os.path.basename(saved[i]))
+                        + _C.dim(f"  Queue total: {total}")
+                    )
+                else:
+                    print(_C.yellow("  Invalid selection."))
+            except ValueError:
+                print(_C.yellow("  Usage: a <n> [count]"))
+            continue
+
+        # ── Remove from queue ───────────────────────────────────────────────
+        if cmd == "dq":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: dq <n>"))
+                continue
+            try:
+                qi = int(parts[1]) - 1
+                if 0 <= qi < len(queue):
+                    removed = queue.pop(qi)
+                    print(_C.b_red(f"  Removed Q{qi+1}: ") + _C.dim(os.path.basename(removed.template_path)))
+                else:
+                    print(_C.yellow("  Invalid queue index."))
+            except ValueError:
+                print(_C.yellow("  Usage: dq <n>"))
+            continue
+
+        # ── Set queue entry count ───────────────────────────────────────────
+        if cmd == "xq":
+            if len(parts) < 3:
+                print(_C.yellow("  Usage: xq <n> <count>"))
+                continue
+            try:
+                qi    = int(parts[1]) - 1
+                count = int(parts[2])
+                if count < 1:
+                    print(_C.yellow("  Count must be >= 1."))
+                    continue
+                if 0 <= qi < len(queue):
+                    queue[qi].count = count
+                    print(_C.b_grn(f"  Q{qi+1} count set to {count}."))
+                else:
+                    print(_C.yellow("  Invalid queue index."))
+            except ValueError:
+                print(_C.yellow("  Usage: xq <n> <count>"))
+            continue
+
+        # ── Preview queue entry (expanded) ──────────────────────────────────
+        if cmd == "vq":
+            if len(parts) < 2:
+                print(_C.yellow("  Usage: vq <n>"))
+                continue
+            try:
+                qi = int(parts[1]) - 1
+                if 0 <= qi < len(queue):
+                    entry = queue[qi]
+                    items = _expand_queue_entry(entry)
+                    print()
+                    print(_C.bold(f"  Q{qi+1} preview") + _C.dim(f"  ({entry.count} order{'s' if entry.count != 1 else ''})"))
+                    print(_C.dim("  " + "─" * 78))
+                    for on, cn, _ in items:
+                        print(f"  {_C.dim('ord:')} {on}   {_C.dim('cont:')} {cn}")
+                    print(_C.dim("  ─── First order XML ───"))
+                    if items:
+                        _print_xml_preview(items[0][2])
+                    print(_C.dim("  " + "─" * 78))
+                    print()
+                else:
+                    print(_C.yellow("  Invalid queue index."))
+            except ValueError:
+                print(_C.yellow("  Usage: vq <n>"))
+            continue
+
+        # ── Set delay ───────────────────────────────────────────────────────
+        if cmd == "delay":
+            if len(parts) < 2:
+                print(_C.yellow(f"  Current delay: {send_delay_ref[0]}s.  Usage: delay <seconds>"))
+                continue
+            try:
+                send_delay_ref[0] = float(parts[1])
+                print(_C.b_grn(f"  Delay set to {send_delay_ref[0]}s."))
+            except ValueError:
+                print(_C.yellow("  Usage: delay <seconds>"))
+            continue
+
+        # ── Send queue ──────────────────────────────────────────────────────
+        if cmd in ("send", "s"):
+            if not queue:
+                print(_C.yellow("  Queue is empty."))
+                continue
+            total = sum(e.count for e in queue)
+            try:
+                confirm = input(
+                    _C.bold(f"  Send {total} order(s) to OSR '")
+                    + _C.b_cyn(osrid) + _C.bold("'?") + _C.dim(" (y/n) ")
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if confirm not in ("y", "yes"):
+                print(_C.dim("  Aborted."))
+                continue
+
+            cfg_sim = load_sim_config(telegrams_dir)
+            sent = 0
+            errors = 0
+            seq = 0
+
+            for entry in queue:
+                items = _expand_queue_entry(entry)
+                for on, cn, xml in items:
+                    seq += 1
+                    print(_C.dim(f"\n  [{seq}/{total}] Sending {on}  (cont: {cn})..."))
+                    ok = sendOrder(xml, osrid)
+                    if ok:
+                        sent += 1
+                        print(_C.b_grn("  Sent."))
+                    else:
+                        errors += 1
+
+                    # Sim insert
+                    if ok:
+                        _do_sim_insert(cfg_sim, entry.order_type, cn, osrid, telegrams_dir, sim_state)
+
+                    if seq < total and send_delay_ref[0] > 0:
+                        time.sleep(send_delay_ref[0])
+
+            print()
+            suffix = f", {errors} failed." if errors else "."
+            print(_C.b_grn(f"  Done. {sent} order(s) sent") + suffix)
+
+            # Advance bases for next send
+            for entry in queue:
+                entry.order_num_base = increment_suffix(entry.order_num_base, entry.count)
+                entry.container_base  = increment_suffix(entry.container_base, entry.count)
+            continue
+
+        # ── Clear queue ──────────────────────────────────────────────────────
+        if cmd in ("clear", "c"):
+            if queue:
+                try:
+                    ans = input(_C.b_red("  Clear queue?") + _C.dim(" (y/n) ")).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if ans in ("y", "yes"):
+                    queue.clear()
+                    print(_C.dim("  Queue cleared."))
+            else:
+                print(_C.dim("  Queue is already empty."))
+            continue
+
+        # ── Container naming config ─────────────────────────────────────────
+        if cmd == "cfg":
+            _cfg_naming_menu(telegrams_dir)
+            continue
+
+        # ── Sim config ──────────────────────────────────────────────────────
+        if cmd == "sim":
+            sim_menu(telegrams_dir, osrid)
+            continue
+
+        print(_C.yellow("  Unknown command."))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN PICKER
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PICKER_HELP = (
+    _C.dim("  ")
+    + _C.bold("<n>")        + _C.dim(" send   ")
+    + _C.bold("v <n>")      + _C.dim(" preview   ")
+    + _C.bold("e <n>")      + _C.dim(" edit   ")
+    + _C.b_red("d <n..>")   + _C.dim(" delete   ")
+    + _C.bold("m <n>")      + _C.dim(" rename   ")
+    + _C.bold("dup <n>")    + _C.dim(" copy   ")
+    + _C.b_grn("n")         + _C.dim(" new   ")
+    + _C.bold("/<text>")    + _C.dim(" search   ")
+    + _C.bold("r")          + _C.dim(" refresh   ")
+    + _C.bold("Q")          + _C.dim(" queue   ")
+    + _C.bold("sim")        + _C.dim(" simulator   ")
+    + _C.bold("q")          + _C.dim(" quit")
+)
+
+
+def choose_saved_telegram(telegrams_dir, editor, queue, send_delay_ref, osrid):
+    """Returns the path of the selected telegram for sending."""
+    search_query = None
+    all_saved = list_saved_telegrams(telegrams_dir)
+    saved = _print_telegram_list(all_saved)
+    if not saved:
+        sys.exit(1)
+    print(_PICKER_HELP)
+
+    def _refresh_list():
+        nonlocal all_saved, saved
+        all_saved = list_saved_telegrams(telegrams_dir)
+        if search_query:
+            saved = _print_telegram_list(_filter_telegrams(all_saved, search_query), search_query)
+        else:
+            saved = _print_telegram_list(all_saved)
+
+    while True:
+        try:
+            raw = input(_C.b_cyn("  > ") if _C._on else "  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n" + _C.dim("  Aborted."))
+            sys.exit(0)
+
+        if not raw:
+            continue
+
+        # ── Check for uppercase Q (queue) BEFORE lowercasing ────────────────
+        if raw == "Q":
+            queue_menu(telegrams_dir, osrid, editor, queue, send_delay_ref)
+            _refresh_list()
+            if not saved:
+                sys.exit(1)
+            print(_PICKER_HELP)
+            continue
+
+        low = raw.lower()
+
+        if low in ("q", "quit", "exit"):
+            print(_C.dim("  Aborted."))
+            sys.exit(0)
+
+        if low == "queue":
+            queue_menu(telegrams_dir, osrid, editor, queue, send_delay_ref)
+            _refresh_list()
+            if not saved:
+                sys.exit(1)
+            print(_PICKER_HELP)
+            continue
+
+        if low in ("r", "refresh"):
+            search_query = None
+            _refresh_list()
+            if not saved:
+                sys.exit(1)
+            print(_PICKER_HELP)
+            continue
+
+        if low in ("n", "new"):
+            new_path, _ = create_new_telegram(editor, telegrams_dir)
+            if new_path:
+                print(_C.b_grn("  Created ") + _C.cyan(os.path.basename(new_path)))
+            _refresh_list()
+            if not saved:
+                sys.exit(1)
+            print(_PICKER_HELP)
+            continue
+
+        if low == "sim":
+            sim_menu(telegrams_dir, osrid)
+            _refresh_list()
+            print(_PICKER_HELP)
+            continue
+
+        # ── Search filter ────────────────────────────────────────────────────
+        if raw.startswith("/"):
+            search_query = raw[1:].strip() or None
+            _refresh_list()
+            if saved:
+                print(_PICKER_HELP)
+            continue
+
+        # ── Command + number(s) ──────────────────────────────────────────────
+        cmd  = None
+        rest = raw
+        # Check "dup " before "d " to avoid prefix collision
+        for prefix in ("dup ", "v ", "d ", "e ", "m "):
+            if low.startswith(prefix):
+                cmd  = prefix.strip()
+                rest = raw[len(prefix):].strip()
+                break
+
+        # ── Multi-delete ─────────────────────────────────────────────────────
+        if cmd == "d":
+            tokens = rest.split()
+            if not tokens:
+                print(_C.yellow("  Usage: d <n> [n2 n3 ...] or d <n>-<m>"))
+                continue
+            idxs = _parse_indices(tokens, len(saved))
+            if not idxs:
+                print(_C.yellow("  No valid indices provided."))
+                continue
+            targets = [saved[i] for i in idxs]
+            if len(targets) == 1:
+                fname = os.path.basename(targets[0])
+                prompt = _C.b_red(f"  Delete {fname}?") + _C.dim(" (y/n) ")
+            else:
+                print(_C.b_red(f"  Delete {len(targets)} telegrams:"))
+                for t in targets:
+                    print(_C.dim(f"    {os.path.basename(t)}"))
+                prompt = _C.b_red("  Confirm delete all?") + _C.dim(" (y/n) ")
+            try:
+                ans = input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if ans in ("y", "yes"):
+                for t in targets:
+                    if delete_telegram(t):
+                        print(_C.b_red("  Deleted ") + _C.dim(os.path.basename(t)))
+                        queue[:] = [qe for qe in queue if qe.template_path != t]
+            else:
+                print(_C.dim("  Delete cancelled."))
+            _refresh_list()
+            if not saved:
+                print(_C.dim("  No telegrams remaining."))
+                sys.exit(0)
+            print(_PICKER_HELP)
+            continue
+
+        try:
+            index = int(rest)
+        except ValueError:
+            print(_C.yellow("  Unknown command.") + "  " + _PICKER_HELP.strip())
+            continue
+
+        if index < 1 or index > len(saved):
+            print(_C.yellow(f"  Invalid selection. Choose 1 through {len(saved)}."))
+            continue
+
+        selected = saved[index - 1]
+        filename = os.path.basename(selected)
+
+        if cmd == "v":
+            _print_xml_preview(_read_file(selected))
+            continue
+
+        if cmd == "e":
+            new_content = edit_telegram_in_place(editor, selected)
+            if new_content:
+                print(_C.b_grn("  Updated ") + _C.cyan(f"telegrams/{filename}"))
+                _refresh_list()
+                print(_PICKER_HELP)
+            continue
+
+        if cmd == "m":
+            try:
+                new_name = input(_C.dim(f"  Rename '{filename}' to: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if new_name:
+                new_path = rename_telegram(selected, new_name, telegrams_dir)
+                if new_path:
+                    print(_C.b_grn("  Renamed \u2192 ") + _C.cyan(os.path.basename(new_path)))
+                    _refresh_list()
+                    print(_PICKER_HELP)
+            continue
+
+        if cmd == "dup":
+            new_path = duplicate_telegram(selected, telegrams_dir)
+            print(_C.b_grn("  Copied \u2192 ") + _C.cyan(os.path.basename(new_path)))
+            _refresh_list()
+            print(_PICKER_HELP)
+            continue
+
+        # No prefix — user picked this telegram to send
+        return selected
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEND ONE  (used by --pick / --last / stdin / file modes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _send_one(order, osrid, telegrams_dir, source_label, skip_confirm, no_sim):
+    """Validate, save, preview, confirm, and send a single XML telegram.
+
+    Handles sim insert automatically unless no_sim is True.
+    """
+    if not _validate_xml(order):
+        sys.exit(1)
+
+    saved, created = save_telegram_new(order, telegrams_dir)
+    if created:
+        print(_C.b_grn("  Saved ") + _C.cyan(f"telegrams/{saved}"))
+    elif source_label:
+        print(_C.dim(f"  Using {source_label}"))
+    else:
+        print(_C.dim(f"  Already saved as telegrams/{saved}"))
+
+    _print_xml_preview(order)
+
+    def _after_send():
+        """Run post-send steps: print confirmation and optionally insert into sim."""
+        print(_C.b_grn(f"  Sent to {osrid}.") + _C.dim(f"  telegrams/{saved}"))
+        if not no_sim:
+            cfg_sim = load_sim_config(telegrams_dir)
+            order_type, _, container_num = detect_order_type(order)
+            sim_state = {"source_idx": 0, "target_idx": 0}
+            _do_sim_insert(cfg_sim, order_type, container_num, osrid, telegrams_dir, sim_state)
+
+    if skip_confirm:
+        ok = sendOrder(order, osrid)
+        if not ok:
+            sys.exit(1)
+        _after_send()
+        return
+
+    try:
+        confirm = input(
+            _C.bold("  Send to ") + _C.b_cyn(osrid) + _C.bold("?") + _C.dim(" (y/n) ")
+        )
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    if confirm.strip().lower() in ("y", "yes"):
+        ok = sendOrder(order, osrid)
+        if not ok:
+            sys.exit(1)
+        _after_send()
+    else:
+        print(_C.dim(f"  Aborted. telegrams/{saved}"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="sendText",
+        description="Send an XML telegram to the OSR."
+    )
+    parser.add_argument("--osr-id",    metavar="OSR_ID",
+                        help="OSR target (e.g. osr1). Can also be set via $OSR_ID.")
+    parser.add_argument("file",        nargs="?", metavar="FILE",
+                        help="XML file or saved telegram name to send (resolves from telegrams/ by name).")
+    parser.add_argument("--editor",    metavar="EDITOR",
+                        help="Editor to use (overrides $EDITOR, default: vi).")
+    parser.add_argument("--list-saved", action="store_true",
+                        help="List saved telegrams from telegrams/ and exit.")
+    parser.add_argument("--pick", "-p", action="store_true",
+                        help="Pick a saved telegram from an interactive numbered menu (one-shot).")
+    parser.add_argument("--last",      action="store_true",
+                        help="Use the newest saved telegram from telegrams/.")
+    parser.add_argument("--delete",    metavar="SAVED_XML",
+                        help="Delete a specific saved telegram by filename or path and exit.")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Send without the final confirmation prompt.")
+    parser.add_argument("--no-sim",    action="store_true",
+                        help="Skip simulator insert even if sim is enabled.")
+    args = parser.parse_args()
+
+    osrid = args.osr_id or os.environ.get("OSR_ID", "")
+    if not osrid and not args.list_saved and not args.delete:
+        parser.error("osr-id must be specified via --osr-id or $OSR_ID")
+
+    if osrid:
+        src = "command line" if args.osr_id else "environment"
+        print(_C.dim(f"  OSR target: ") + _C.b_cyn(osrid) + _C.dim(f"  ({src})"))
+
+    script_dir    = os.path.dirname(os.path.abspath(__file__))
+    telegrams_dir = os.path.join(script_dir, "telegrams")
+    os.makedirs(telegrams_dir, exist_ok=True)
+
+    # ── One-shot exit modes ──────────────────────────────────────────────────
+    if args.list_saved:
+        print_saved_telegrams(telegrams_dir)
+        sys.exit(0)
+
+    if args.delete:
+        target   = resolve_saved_telegram(args.delete, telegrams_dir)
+        filename = os.path.basename(target)
+        try:
+            answer = input(_C.b_red(f"  Delete telegrams/{filename}?") + _C.dim(" (y/n) ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+        if answer in ("y", "yes"):
+            if delete_telegram(target):
+                print(_C.b_red("  Deleted ") + _C.dim(f"telegrams/{filename}"))
+        else:
+            print(_C.dim("  Delete cancelled."))
+        sys.exit(0)
+
+    editor = args.editor or os.environ.get("EDITOR", "notepad" if sys.platform == "win32" else "vi")
+    queue          = []
+    send_delay_ref = [2.0]
+
+    # Start background sim container cache refresher if sim is enabled.
+    # Runs immediately on startup and then every _SIM_CACHE_TTL/2 seconds so
+    # sim_container_exists() always reads from a warm cache with no blocking.
+    cfg_sim_init = load_sim_config(telegrams_dir)
+    if cfg_sim_init.get("enabled") and not args.no_sim:
+        _start_sim_cache_refresher(cfg_sim_init["sim_user"], f"sim{osrid}")
+
+    # ── Non-interactive / one-shot send modes ────────────────────────────────
+    if args.pick:
+        selected = choose_saved_telegram(telegrams_dir, editor, queue, send_delay_ref, osrid)
+        order    = _read_file(selected)
+        _send_one(order, osrid, telegrams_dir,
+                  f"telegrams/{os.path.basename(selected)}", args.yes, args.no_sim)
+        sys.exit(0)
+
+    if args.last:
+        selected = latest_telegram_path(telegrams_dir)
+        if not selected:
+            print(_C.b_red("  Error: no saved telegrams found in telegrams/."))
+            sys.exit(1)
+        order = _read_file(selected)
+        _send_one(order, osrid, telegrams_dir,
+                  f"telegrams/{os.path.basename(selected)}", args.yes, args.no_sim)
+        sys.exit(0)
+
+    if not sys.stdin.isatty():
+        order = sys.stdin.read().strip()
+        print(_C.dim("  Reading XML from stdin..."))
+        _send_one(order, osrid, telegrams_dir, None, args.yes, args.no_sim)
+        sys.exit(0)
+
+    if args.file:
+        # Resolve bare name (e.g. "transport-flowrack.xml") from telegrams/ if not a direct path
+        selected = resolve_saved_telegram(args.file, telegrams_dir)
+        order    = _read_file(selected)
+        label    = selected if os.path.dirname(selected) else f"telegrams/{os.path.basename(selected)}"
+        _send_one(order, osrid, telegrams_dir, label, args.yes, args.no_sim)
+        sys.exit(0)
+
+    # ── Interactive loop ─────────────────────────────────────────────────────
+    while True:
+        if latest_telegram_path(telegrams_dir):
+            selected = choose_saved_telegram(telegrams_dir, editor, queue, send_delay_ref, osrid)
+            order    = _read_file(selected)
+            label    = f"telegrams/{os.path.basename(selected)}"
+        else:
+            print(_C.dim("  No saved telegrams yet — opening editor for a new telegram."))
+            order = _edit_new_from_latest(editor, telegrams_dir)
+            label = None
+
+        if not order:
+            print(_C.b_red("  Error: no XML telegram provided."))
+            continue
+
+        if not _validate_xml(order):
+            continue
+
+        saved_fn, created = save_telegram_new(order, telegrams_dir)
+        if created:
+            print(_C.b_grn("  Saved ") + _C.cyan(f"telegrams/{saved_fn}"))
+        elif label:
+            print(_C.dim(f"  Using {label}"))
+        else:
+            print(_C.dim(f"  Already saved as telegrams/{saved_fn}"))
+
+        _print_xml_preview(order)
+
+        try:
+            confirm = input(
+                _C.bold("  Send to ") + _C.b_cyn(osrid) + _C.bold("?") + _C.dim(" (y/n) ")
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if confirm.strip().lower() in ("y", "yes"):
+            ok = sendOrder(order, osrid)
+            if ok:
+                print(_C.b_grn(f"  Sent to {osrid}.") + _C.dim(f"  telegrams/{saved_fn}"))
+                # Sim insert
+                if not args.no_sim:
+                    cfg_sim = load_sim_config(telegrams_dir)
+                    order_type, _, container_num = detect_order_type(order)
+                    sim_state = {"source_idx": 0, "target_idx": 0}
+                    _do_sim_insert(cfg_sim, order_type, container_num, osrid, telegrams_dir, sim_state)
+            else:
+                print(_C.b_red("  Send failed."))
+        else:
+            print(_C.dim(f"  Aborted. telegrams/{saved_fn}"))
+
+        # Loop back to picker
+
+
+if __name__ == "__main__":
+    main()
