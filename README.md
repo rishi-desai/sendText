@@ -35,7 +35,6 @@ scripts/
 Set the target OSR via environment variable or flag:
 
 ```bash
-export OSR_ID=osr1
 sendText                       # uses $OSR_ID
 sendText --osr-id osr1         # or explicit flag
 ```
