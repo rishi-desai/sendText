@@ -35,6 +35,24 @@ from omniORB import CORBA
 import OSR, OSR__POA
 import CosNaming
 
+# ── Oracle DB (for sim container check) ──────────────────────────────────────
+try:
+    import oracledb as _oracle_lib
+    _ORACLE_LIB = "oracledb"
+except ImportError:
+    try:
+        import cx_Oracle as _oracle_lib
+        _ORACLE_LIB = "cx_Oracle"
+    except ImportError:
+        _oracle_lib = None
+        _ORACLE_LIB = None
+
+
+def _is_sandbox():
+    """Return True if running on a test/sandbox system."""
+    return os.path.isfile("/home/osr/OSR_NO_PICKSTATION")
+
+
 # ── Global Values / Custom Configs ────────────────────────────────────────────────────────
 _ORDER_TYPE_LABELS = {
     "pick":         ("PICK",         "1;36"),
@@ -120,6 +138,7 @@ def save_container_naming(telegrams_dir, naming):
 _DEFAULT_SIM = {
     "enabled": False,
     "sim_user": "sandbox",
+    "db_host": "osr",
     "default_source_element": "",
     "default_target_element": "",
 }
@@ -172,32 +191,47 @@ def run_sim(sim_user, sim_osr, element_filter, container):
 
 
 # ── Simulator container cache ────────────────────────────────────────────────
-# Container lists are fetched in a background thread so sends don't block.
+# Container lists are queried from the sandbox DB in a background thread.
 # Cache is keyed by sim_osr and expires after _SIM_CACHE_TTL seconds.
 
 _SIM_CACHE_TTL  = 60  # seconds before a cached container list is considered stale
-_sim_cache      = {}  # {sim_osr: {"output": str, "fetched_at": float}}
+_sim_cache      = {}  # {sim_osr: {"containers": set, "fetched_at": float}}
 _sim_cache_lock = threading.Lock()
 
 
-def _fetch_sim_containers(sim_user, sim_osr):
-    """Fetch the full container list from the simulator and store it in the cache.
+def _fetch_sim_containers(db_host, sim_osr):
+    """Query the sandbox DB for all containers registered in sim_osr.
 
-    Intended to be called from a daemon thread via prefetch_sim_cache().
-    Uses the simulator binary directly (same as run_sim) so it works in the
-    non-interactive sudo su shell where wrapper scripts are not on PATH.
+    Stores a set of lowercased LOADING_UNIT_CODE values in the cache.
+    Intended to be called from a daemon thread via _start_sim_cache_refresher().
     """
-    cmd = (
-        f"sudo su - {sim_user} -c "
-        f"'simulator --config {sim_osr}.properties -c'"
-    )
-    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-    output = result.stdout + result.stderr
+    if not _oracle_lib or not db_host:
+        with _sim_cache_lock:
+            _sim_cache[sim_osr] = {"containers": set(), "fetched_at": time.monotonic()}
+        return
+    try:
+        if _ORACLE_LIB == "oracledb":
+            conn = _oracle_lib.connect(user="sandbox", password="sandbox", dsn=f"{db_host}/KXXL")
+        else:
+            dsn = _oracle_lib.makedsn(db_host, 1521, service_name="KXXL")
+            conn = _oracle_lib.connect("sandbox", "sandbox", dsn)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT LOADING_UNIT_CODE FROM LOADING_UNIT lu "
+                    "JOIN INSTANCE i ON i.INSTANCE_ID = lu.INSTANCE_ID "
+                    "WHERE TOKEN = :token",
+                    token=sim_osr,
+                )
+                containers = {row[0].lower() for row in cur.fetchall()}
+    except Exception as e:
+        print(_C.yellow(f"  Sim DB: could not query container list: {e}"))
+        containers = set()
     with _sim_cache_lock:
-        _sim_cache[sim_osr] = {"output": output, "fetched_at": time.monotonic()}
+        _sim_cache[sim_osr] = {"containers": containers, "fetched_at": time.monotonic()}
 
 
-def _start_sim_cache_refresher(sim_user, sim_osr):
+def _start_sim_cache_refresher(db_host, sim_osr):
     """Start a single daemon thread that keeps the container cache continuously warm.
 
     The thread runs for the lifetime of the process, refreshing the cache every
@@ -210,51 +244,54 @@ def _start_sim_cache_refresher(sim_user, sim_osr):
 
     def _loop():
         while True:
-            _fetch_sim_containers(sim_user, sim_osr)
+            _fetch_sim_containers(db_host, sim_osr)
             time.sleep(_SIM_CACHE_TTL / 2)
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
 
 
-def sim_container_exists(sim_user, sim_osr, container):
+def sim_container_exists(db_host, sim_osr, container):
     """Return True if container is already registered in the simulator.
 
-    Uses the in-memory cache populated by prefetch_sim_cache() / _fetch_sim_containers().
+    Uses the in-memory cache populated by _start_sim_cache_refresher().
     If the cache is stale or missing, fetches inline (blocking) as a fallback.
     """
     with _sim_cache_lock:
         entry = _sim_cache.get(sim_osr)
         if entry and (time.monotonic() - entry["fetched_at"]) < _SIM_CACHE_TTL:
-            return container.lower() in entry["output"].lower()
+            return container.lower() in entry.get("containers", set())
 
     # Cache miss or expired — fetch inline so we always get a correct answer.
     print(_C.dim("  Sim: refreshing container list..."))
-    _fetch_sim_containers(sim_user, sim_osr)
+    _fetch_sim_containers(db_host, sim_osr)
     with _sim_cache_lock:
         entry = _sim_cache.get(sim_osr)
-    return bool(entry) and container.lower() in entry["output"].lower()
+    return bool(entry) and container.lower() in entry.get("containers", set())
 
 
 def _do_sim_insert(cfg_sim, order_type, container_num, osrid, telegrams_dir, sim_state):
     """Perform a simulator insert after sending an order.
 
-    Only runs for order types listed in _SIM_INSERT_TYPES.  Always checks
-    whether the container is already present in the simulator before inserting
-    to avoid duplicates.
+    Only runs on sandbox/test systems and for order types listed in _SIM_INSERT_TYPES.
+    Always checks whether the container is already present in the simulator before
+    inserting to avoid duplicates.
 
     To enable sim inserts for a new order type, add it to _SIM_INSERT_TYPES.
     To change which element list a new type uses, update pick_sim_element.
     """
+    if not _is_sandbox():
+        return
     if not cfg_sim.get("enabled"):
         return
     if order_type not in _SIM_INSERT_TYPES:
         return
 
     sim_osr = f"sim{osrid}"
+    db_host = cfg_sim.get("db_host", "osr")
 
     if order_type not in _ALWAYS_SIM_INSERT:
-        if sim_container_exists(cfg_sim["sim_user"], sim_osr, container_num):
+        if sim_container_exists(db_host, sim_osr, container_num):
             print(_C.dim(f"  Sim: {container_num} already present — skipping insert."))
             return
 
@@ -760,6 +797,9 @@ def _print_xml_preview(xml_str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sim_menu(telegrams_dir, osrid):
+    if not _is_sandbox():
+        print(_C.b_red("  Simulator config is not available on live systems."))
+        return
     while True:
         cfg = load_sim_config(telegrams_dir)
         src_elems = load_element_list(telegrams_dir, "sourceLoop.txt")
@@ -773,6 +813,7 @@ def sim_menu(telegrams_dir, osrid):
         print(f"  Status          : {enabled}")
         print(f"  Sim OSR         : {_C.cyan(sim_osr)}  {_C.dim('(derived from OSR_ID)')}")
         print(f"  Sim user        : {_C.cyan(cfg['sim_user'])}")
+        print(f"  DB host         : {_C.cyan(cfg.get('db_host', 'osr'))}")
         print(f"  Default source  : {_C.cyan(cfg['default_source_element'] or '(none)')}")
         print(f"  Default target  : {_C.cyan(cfg['default_target_element'] or '(none)')}")
         print()
@@ -790,6 +831,7 @@ def sim_menu(telegrams_dir, osrid):
         print(
             "  " + _C.bold("toggle") + _C.dim("  on/off   ")
             + _C.bold("user <name>") + _C.dim("  sim user   ")
+            + _C.bold("dbhost <host>") + _C.dim("  DB host   ")
             + _C.bold("src <elem>") + _C.dim("  default source   ")
             + _C.bold("tgt <elem>") + _C.dim("  default target")
         )
@@ -828,6 +870,13 @@ def sim_menu(telegrams_dir, osrid):
                 print(_C.b_grn("  Sim user updated."))
             else:
                 print(_C.yellow("  Usage: user <name>"))
+        elif cmd == "dbhost":
+            if arg:
+                cfg["db_host"] = arg
+                save_sim_config(telegrams_dir, cfg)
+                print(_C.b_grn("  DB host updated."))
+            else:
+                print(_C.yellow("  Usage: dbhost <host>"))
         elif cmd == "src":
             cfg["default_source_element"] = arg
             save_sim_config(telegrams_dir, cfg)
@@ -970,7 +1019,7 @@ _QUEUE_HELP_ACTIONS = (
     + _C.bold("clear") + _C.dim(" clear queue   ")
     + _C.bold("delay <s>") + _C.dim(" set delay   ")
     + _C.bold("cfg") + _C.dim(" naming   ")
-    + _C.bold("sim") + _C.dim(" simulator   ")
+    + (_C.bold("sim") + _C.dim(" simulator   ") if _is_sandbox() else "")
     + _C.bold("r") + _C.dim(" refresh   ")
     + _C.bold("back") + _C.dim(" return")
 )
@@ -1315,7 +1364,8 @@ def queue_menu(telegrams_dir, osrid, editor, queue, send_delay_ref):
 
         # ── Sim config ──────────────────────────────────────────────────────
         if cmd == "sim":
-            sim_menu(telegrams_dir, osrid)
+            if _is_sandbox():
+                sim_menu(telegrams_dir, osrid)
             continue
 
         print(_C.yellow("  Unknown command."))
@@ -1337,7 +1387,7 @@ _PICKER_HELP = (
     + _C.bold("/<text>")    + _C.dim(" search   ")
     + _C.bold("r")          + _C.dim(" refresh   ")
     + _C.bold("Q")          + _C.dim(" queue   ")
-    + _C.bold("sim")        + _C.dim(" simulator   ")
+    + (_C.bold("sim") + _C.dim(" simulator   ") if _is_sandbox() else "")
     + _C.bold("q")          + _C.dim(" quit")
 )
 
@@ -1411,9 +1461,10 @@ def choose_saved_telegram(telegrams_dir, editor, queue, send_delay_ref, osrid):
             continue
 
         if low == "sim":
-            sim_menu(telegrams_dir, osrid)
-            _refresh_list()
-            print(_PICKER_HELP)
+            if _is_sandbox():
+                sim_menu(telegrams_dir, osrid)
+                _refresh_list()
+                print(_PICKER_HELP)
             continue
 
         # ── Search filter ────────────────────────────────────────────────────
@@ -1641,12 +1692,12 @@ def main():
     queue          = []
     send_delay_ref = [2.0]
 
-    # Start background sim container cache refresher if sim is enabled.
-    # Runs immediately on startup and then every _SIM_CACHE_TTL/2 seconds so
-    # sim_container_exists() always reads from a warm cache with no blocking.
+    # Start background sim container cache refresher on sandbox systems if sim is enabled.
+    # Queries the sandbox DB every _SIM_CACHE_TTL/2 seconds so sim_container_exists()
+    # always reads from a warm cache with no blocking.
     cfg_sim_init = load_sim_config(telegrams_dir)
-    if cfg_sim_init.get("enabled") and not args.no_sim:
-        _start_sim_cache_refresher(cfg_sim_init["sim_user"], f"sim{osrid}")
+    if cfg_sim_init.get("enabled") and not args.no_sim and _is_sandbox():
+        _start_sim_cache_refresher(cfg_sim_init.get("db_host", "osr"), f"sim{osrid}")
 
     # ── Non-interactive / one-shot send modes ────────────────────────────────
     if args.pick:
