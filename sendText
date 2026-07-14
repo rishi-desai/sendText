@@ -218,12 +218,16 @@ def _fetch_sim_containers(db_host, sim_osr):
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT LOADING_UNIT_CODE FROM LOADING_UNIT lu "
+                    "SELECT LOADING_UNIT_CODE, ELEMENT_ID FROM LOADING_UNIT lu "
                     "JOIN INSTANCE i ON i.INSTANCE_ID = lu.INSTANCE_ID "
                     "WHERE TOKEN = :token",
                     token=sim_osr,
                 )
-                containers = {row[0].lower() for row in cur.fetchall()}
+                containers = {
+                    row[0].lower()
+                    for row in cur.fetchall()
+                    if row[1] is not None
+                }
     except Exception as e:
         print(_C.yellow(f"  Sim DB: could not query container list: {e}"))
         containers = set()
